@@ -1,0 +1,57 @@
+# Xcode
+build/
+DerivedData/
+*.pbxuser
+!default.pbxuser
+*.mode1v3
+!default.mode1v3
+*.mode2v3
+!default.mode2v3
+*.perspectivev3
+!default.perspectivev3
+xcuserdata/
+*.moved-aside
+*.hmap
+*.ipa
+*.dSYM.zip
+*.dSYM
+timeline.xctimeline
+playground.xcworkspace
+
+# Obj-C / Swift
+*.o
+*.linkFileList
+*.hmap
+
+# SPM
+.build/
+.swiftpm/xcode/package.xcworkspace/contents.xcworkspacedata
+.swiftpm/xcode/package.xcworkspace/xcuserdata/
+
+# CocoaPods (uncomment if you don't commit Pods/)
+# Pods/
+
+# Carthage
+Carthage/Build/
+
+# fastlane
+fastlane/report.xml
+fastlane/Preview.html
+fastlane/screenshots/**/*.png
+fastlane/test_output
+
+# macOS
+.DS_Store
+._*
+.Spotlight-V100
+.Trashes
+
+# Signing / secrets
+*.p12
+*.mobileprovision
+*.provisionprofile
+*.pem
+Secrets.xcconfig
+.env
+.env.*
+!.env.example
