@@ -121,9 +121,58 @@ private func stringAttr(_ element: AXUIElement, _ name: String) -> String? {
     copyAttr(element, name) as? String
 }
 
-private func boolAttr(_ element: AXUIElement, _ name: String) -> Bool {
-    if let value = copyAttr(element, name) as? Bool { return value }
-    return (copyAttr(element, name) as? NSNumber)?.boolValue ?? false
+private func cgFloat(_ value: Any?) -> CGFloat? {
+    switch value {
+    case let number as CGFloat:
+        return number
+    case let number as Int:
+        return CGFloat(number)
+    case let number as NSNumber:
+        return CGFloat(number.doubleValue)
+    default:
+        return nil
+    }
+}
+
+private func intNumber(_ value: Any?) -> Int? {
+    switch value {
+    case let number as Int:
+        return number
+    case let number as NSNumber:
+        return number.intValue
+    default:
+        return nil
+    }
+}
+
+private func wholeNumber(_ value: Any?) -> UInt32? {
+    switch value {
+    case let number as UInt32:
+        return number
+    case let number as Int:
+        return UInt32(number)
+    case let number as NSNumber:
+        return number.uint32Value
+    default:
+        return nil
+    }
+}
+
+private func cgRect(_ value: Any?) -> CGRect? {
+    let raw: [String: Any]
+    if let typed = value as? [String: Any] {
+        raw = typed
+    } else if let typed = value as? NSDictionary {
+        raw = typed as? [String: Any] ?? [:]
+    } else {
+        return nil
+    }
+    guard let x = cgFloat(raw["X"]),
+          let y = cgFloat(raw["Y"]),
+          let width = cgFloat(raw["Width"]),
+          let height = cgFloat(raw["Height"])
+    else { return nil }
+    return CGRect(x: x, y: y, width: width, height: height)
 }
 
 private func windowID(_ element: AXUIElement) -> UInt32? {
@@ -131,24 +180,18 @@ private func windowID(_ element: AXUIElement) -> UInt32? {
     return axWindowID(element, &id) == 0 ? id : nil
 }
 
-private func axFrame(_ element: AXUIElement) -> CGRect? {
-    guard let pos = copyAttr(element, kAXPositionAttribute),
-          let size = copyAttr(element, kAXSizeAttribute)
-    else { return nil }
-    var origin = CGPoint.zero
-    var extent = CGSize.zero
-    guard AXValueGetValue(pos as! AXValue, .cgPoint, &origin),
-          AXValueGetValue(size as! AXValue, .cgSize, &extent)
-    else { return nil }
-    return CGRect(origin: origin, size: extent)
-}
-
-private func setFrame(_ element: AXUIElement, _ rect: CGRect) {
+private func setFrame(_ element: AXUIElement, _ rect: CGRect, from current: CGRect) {
+    let sizeChanged = abs(current.width - rect.width) >= 2 || abs(current.height - rect.height) >= 2
+    let originChanged = abs(current.minX - rect.minX) >= 2 || abs(current.minY - rect.minY) >= 2
+    guard sizeChanged || originChanged else { return }
     var origin = rect.origin
     var extent = rect.size
-    guard let pos = AXValueCreate(.cgPoint, &origin), let size = AXValueCreate(.cgSize, &extent) else { return }
-    AXUIElementSetAttributeValue(element, kAXSizeAttribute as CFString, size)
-    AXUIElementSetAttributeValue(element, kAXPositionAttribute as CFString, pos)
+    if sizeChanged, let size = AXValueCreate(.cgSize, &extent) {
+        AXUIElementSetAttributeValue(element, kAXSizeAttribute as CFString, size)
+    }
+    if originChanged, let pos = AXValueCreate(.cgPoint, &origin) {
+        AXUIElementSetAttributeValue(element, kAXPositionAttribute as CFString, pos)
+    }
 }
 
 private func near(_ a: CGRect, _ b: CGRect) -> Bool {
@@ -170,11 +213,41 @@ private struct TileKey: Hashable {
     var space: UInt64
 }
 
+struct ListedWindow: Equatable {
+    var id: UInt32
+    var pid: pid_t
+    var bounds: CGRect
+    var layer: Int
+    var onScreen: Bool
+}
+
+/// One pass over `CGWindowListCopyWindowInfo`. Layer 0 is a normal window.
+func listedWindows(_ rows: [[String: Any]]) -> [ListedWindow] {
+    rows.compactMap { row in
+        guard let id = wholeNumber(row[kCGWindowNumber as String]), id != 0,
+              let pid = intNumber(row[kCGWindowOwnerPID as String]), pid > 0,
+              let bounds = cgRect(row[kCGWindowBounds as String])
+        else { return nil }
+        let onScreen = (row[kCGWindowIsOnscreen as String] as? Bool)
+            ?? (row[kCGWindowIsOnscreen as String] as? NSNumber)?.boolValue
+            ?? false
+        return ListedWindow(
+            id: id,
+            pid: pid_t(pid),
+            bounds: bounds,
+            layer: intNumber(row[kCGWindowLayer as String]) ?? -1,
+            onScreen: onScreen
+        )
+    }
+}
+
 private struct LiveWindow {
     var id: UInt32
+    var pid: pid_t
     var element: AXUIElement
     var display: String
     var space: UInt64
+    var bounds: CGRect
 }
 
 fileprivate final class Hotkeys {
@@ -229,6 +302,14 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var bundles: [UInt32: String] = [:]
     private var overrides: [UInt32: Bool] = [:]
     private var misses: [UInt32: (target: CGRect, count: Int)] = [:]
+    private var axApps: [pid_t: AXUIElement] = [:]
+    private var quietUntil: [pid_t: TimeInterval] = [:]
+    private var rejected: Set<UInt32> = []
+    private var firstSeen: [UInt32: TimeInterval] = [:]
+    private var spot: [UInt32: TileKey] = [:]
+    private var skipped: Set<UInt32> = []
+    private var spaceTypes: [UInt64: Int32] = [:]
+    private var spotsStale = true
     private var animSkips = 0
     private var configURL: URL {
         FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".config/macwm/config")
@@ -268,10 +349,10 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         watchApps()
         watchConfig()
         mouseMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseUp, .rightMouseUp]) { _ in
-            App.shared.scheduleRefresh()
+            App.shared.scheduleRefresh(fresh: true)
         }
         Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
-            self?.scheduleRefresh()
+            self?.scheduleRefresh(fresh: true)
         }
         updateIcon()
         scheduleRefresh()
@@ -321,7 +402,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
                    let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication {
                     self?.watch(app)
                 }
-                self?.scheduleRefresh()
+                self?.scheduleRefresh(fresh: name == NSWorkspace.activeSpaceDidChangeNotification)
             })
         }
         tokens.append(NotificationCenter.default.addObserver(
@@ -329,7 +410,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
             object: nil,
             queue: .main
         ) { [weak self] _ in
-            self?.scheduleRefresh()
+            self?.scheduleRefresh(fresh: true)
         })
         for app in NSWorkspace.shared.runningApplications where app.activationPolicy != .prohibited {
             watch(app)
@@ -356,16 +437,25 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func unwatch(_ pid: pid_t) {
+        axApps[pid] = nil
+        quietUntil[pid] = nil
         guard let observer = observers.removeValue(forKey: pid) else { return }
         CFRunLoopRemoveSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(observer), .commonModes)
     }
 
-    func scheduleRefresh() {
+    /// `fresh` drops the cached display/space for each window. Drags, space changes, and the 1s timer need that. Focus changes do not.
+    func scheduleRefresh(fresh: Bool = false) {
         guard started, enabled, AXIsProcessTrusted() else { return }
+        if fresh { spotsStale = true }
         refreshItem?.cancel()
         let item = DispatchWorkItem { [weak self] in self?.refresh() }
         refreshItem = item
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.02, execute: item)
+    }
+
+    func noteFocus() {
+        guard enabled, let id = focusedWindow(), let key = windowKey[id] else { return }
+        focusHistory[key] = id
     }
 
     private func refresh() {
@@ -377,7 +467,14 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return
         }
         animSkips = 0
+        if spotsStale {
+            spot.removeAll(keepingCapacity: true)
+            skipped.removeAll(keepingCapacity: true)
+            spaceTypes.removeAll(keepingCapacity: true)
+            spotsStale = false
+        }
 
+        let started = Date()
         let focused = focusedWindow()
         let windows = scan()
         let known = Sky.allSpaceIDs()
@@ -386,7 +483,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
 
         var nextKeys: [UInt32: TileKey] = [:]
-        var moves: [(AXUIElement, CGRect)] = []
+        var moves: [(AXUIElement, CGRect, CGRect)] = []
         let grouped = Dictionary(grouping: windows, by: { TileKey(display: $0.display, space: $0.space) })
         for (key, group) in grouped {
             guard let screen = NSScreen.screens.first(where: { Sky.displayUUID($0) == key.display }) else { continue }
@@ -407,7 +504,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
             for window in group {
                 nextKeys[window.id] = key
                 guard let target = targets[window.id] else { continue }
-                if let current = axFrame(window.element), near(current, target) {
+                if near(window.bounds, target) {
                     misses[window.id] = nil
                     continue
                 }
@@ -416,13 +513,13 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 // ponytail: stop after 3 rejects so a window that will not move cannot flash forever.
                 if count >= 3 { continue }
                 misses[window.id] = (target, count + 1)
-                moves.append((window.element, target))
+                moves.append((window.element, target, window.bounds))
             }
         }
         windowKey = nextKeys
+        log(String(format: "refresh %.0fms windows %d moves %d", Date().timeIntervalSince(started) * 1000, windows.count, moves.count))
         guard !moves.isEmpty else { return }
-        log("moving \(moves.count) windows")
-        for (element, rect) in moves { setFrame(element, rect) }
+        for (element, rect, bounds) in moves { setFrame(element, rect, from: bounds) }
     }
 
     private func displayAnimating() -> Bool {
@@ -432,55 +529,121 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
+    // ponytail: AX is only for windows CGWindowList has not seen before. A wedged app gets 0.1s, then 2s of quiet.
     private func scan() -> [LiveWindow] {
-        let listed = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? []
-        let onScreen = Set(listed.compactMap { row -> UInt32? in
-            let layer = row[kCGWindowLayer as String]
-            let layerNumber = (layer as? Int) ?? (layer as? NSNumber)?.intValue
-            guard layerNumber == 0 else { return nil }
-            if let id = row[kCGWindowNumber as String] as? UInt32 { return id }
-            if let id = row[kCGWindowNumber as String] as? Int { return UInt32(id) }
-            return (row[kCGWindowNumber as String] as? NSNumber)?.uint32Value
-        })
+        let rows = CGWindowListCopyWindowInfo([.excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? []
+        let records = listedWindows(rows)
+        let alive = Set(records.map(\.id))
+        elements = elements.filter { alive.contains($0.key) }
+        pids = pids.filter { alive.contains($0.key) }
+        bundles = bundles.filter { alive.contains($0.key) }
+        overrides = overrides.filter { alive.contains($0.key) }
+        misses = misses.filter { alive.contains($0.key) }
+        rejected = rejected.intersection(alive)
+        firstSeen = firstSeen.filter { alive.contains($0.key) }
+        spot = spot.filter { alive.contains($0.key) }
+        skipped = skipped.intersection(alive)
 
-        var managed: [LiveWindow] = []
-        var nextElements: [UInt32: AXUIElement] = [:]
-        var nextPids: [UInt32: pid_t] = [:]
-        var nextBundles: [UInt32: String] = [:]
-        var alive = Set<UInt32>()
-        var currentByDisplay: [String: UInt64] = [:]
-
-        for app in NSWorkspace.shared.runningApplications where app.activationPolicy != .prohibited {
-            let pid = app.processIdentifier
-            let ax = AXUIElementCreateApplication(pid)
-            AXUIElementSetMessagingTimeout(ax, 0.25)
-            guard let raw = copyAttr(ax, kAXWindowsAttribute) else { continue }
-            for element in axElements(raw) {
-                guard stringAttr(element, kAXRoleAttribute) == "AXWindow" else { continue }
-                if let sub = stringAttr(element, kAXSubroleAttribute), blockedSubroles.contains(sub) { continue }
-                guard let id = windowID(element), id != 0 else { continue }
-                alive.insert(id)
-                guard onScreen.contains(id), !boolAttr(element, kAXMinimizedAttribute), !boolAttr(element, "AXFullScreen") else { continue }
-                nextElements[id] = element
-                nextPids[id] = pid
-                if let bundle = app.bundleIdentifier { nextBundles[id] = bundle }
-                if floating(id, bundle: app.bundleIdentifier) { continue }
-                guard let display = Sky.display(for: id) else { continue }
-                let spaces = Sky.spaces(for: id)
-                guard spaces.count == 1, let space = spaces.first, Sky.spaceType(space) == 0 else { continue }
-                let current = currentByDisplay[display] ?? Sky.currentSpace(display)
-                currentByDisplay[display] = current
-                guard space == current else { continue }
-                managed.append(LiveWindow(id: id, element: element, display: display, space: space))
+        var wanted: [pid_t: Set<UInt32>] = [:]
+        for window in records where window.onScreen && window.layer == 0 && elements[window.id] == nil && !rejected.contains(window.id) {
+            wanted[window.pid, default: []].insert(window.id)
+        }
+        var retry = false
+        for (pid, ids) in wanted where resolve(pid, wanted: ids) {
+            retry = true
+        }
+        if retry {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
+                self?.scheduleRefresh()
             }
         }
 
-        elements = nextElements
-        pids = nextPids
-        bundles = nextBundles
-        overrides = overrides.filter { alive.contains($0.key) }
-        misses = misses.filter { nextElements[$0.key] != nil }
+        var managed: [LiveWindow] = []
+        var currentByDisplay: [String: UInt64] = [:]
+        for window in records where window.onScreen && window.layer == 0 {
+            guard let element = elements[window.id] else { continue }
+            let bundle = bundles[window.id]
+            if floating(window.id, bundle: bundle) { continue }
+            guard let place = place(window.id) else { continue }
+            let current = currentByDisplay[place.display] ?? Sky.currentSpace(place.display)
+            currentByDisplay[place.display] = current
+            guard place.space == current else { continue }
+            managed.append(LiveWindow(
+                id: window.id,
+                pid: window.pid,
+                element: element,
+                display: place.display,
+                space: place.space,
+                bounds: window.bounds
+            ))
+        }
         return managed
+    }
+
+    private func resolve(_ pid: pid_t, wanted: Set<UInt32>) -> Bool {
+        let now = ProcessInfo.processInfo.systemUptime
+        if let until = quietUntil[pid], until > now { return false }
+        let ax = applicationElement(pid)
+        guard let raw = copyAttr(ax, kAXWindowsAttribute) else {
+            quietUntil[pid] = now + 2
+            return false
+        }
+        var found = Set<UInt32>()
+        var retry = false
+        for element in axElements(raw) {
+            guard let id = windowID(element), wanted.contains(id) else { continue }
+            found.insert(id)
+            firstSeen[id] = nil
+            if let sub = stringAttr(element, kAXSubroleAttribute), blockedSubroles.contains(sub) {
+                rejected.insert(id)
+                continue
+            }
+            elements[id] = element
+            pids[id] = pid
+            if bundles[id] == nil, let bundle = NSRunningApplication(processIdentifier: pid)?.bundleIdentifier {
+                bundles[id] = bundle
+            }
+        }
+        // ponytail: a CG window that AX never lists is ignored after 1s. Brand new windows keep retrying until then.
+        for id in wanted where !found.contains(id) {
+            let seen = firstSeen[id] ?? now
+            firstSeen[id] = seen
+            if now - seen > 1 {
+                rejected.insert(id)
+            } else {
+                retry = true
+            }
+        }
+        return retry
+    }
+
+    private func applicationElement(_ pid: pid_t) -> AXUIElement {
+        if let existing = axApps[pid] { return existing }
+        let ax = AXUIElementCreateApplication(pid)
+        AXUIElementSetMessagingTimeout(ax, 0.1)
+        axApps[pid] = ax
+        return ax
+    }
+
+    /// Cached until a drag, a space change, or the 1s timer. SkyLight on every focus was the hitch.
+    private func place(_ id: UInt32) -> TileKey? {
+        if skipped.contains(id) { return nil }
+        if let hit = spot[id] { return hit }
+        guard let display = Sky.display(for: id) else { return nil }
+        let spaces = Sky.spaces(for: id)
+        guard spaces.count == 1, let space = spaces.first else {
+            skipped.insert(id)
+            return nil
+        }
+        let type = spaceTypes[space] ?? Sky.spaceType(space)
+        spaceTypes[space] = type
+        guard type == 0 else {
+            skipped.insert(id)
+            return nil
+        }
+        let key = TileKey(display: display, space: space)
+        spot[id] = key
+        return key
     }
 
     private func floating(_ id: UInt32, bundle: String?) -> Bool {
@@ -491,7 +654,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func focusedWindow() -> UInt32? {
         guard let front = NSWorkspace.shared.frontmostApplication else { return nil }
-        let app = AXUIElementCreateApplication(front.processIdentifier)
+        let app = applicationElement(front.processIdentifier)
         guard let raw = copyAttr(app, kAXFocusedWindowAttribute), CFGetTypeID(raw) == AXUIElementGetTypeID() else { return nil }
         return windowID(unsafeBitCast(raw, to: AXUIElement.self))
     }
@@ -561,7 +724,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func focusedElement() -> AXUIElement? {
         guard let front = NSWorkspace.shared.frontmostApplication else { return nil }
-        let app = AXUIElementCreateApplication(front.processIdentifier)
+        let app = applicationElement(front.processIdentifier)
         guard let raw = copyAttr(app, kAXFocusedWindowAttribute), CFGetTypeID(raw) == AXUIElementGetTypeID() else { return nil }
         return unsafeBitCast(raw, to: AXUIElement.self)
     }
@@ -668,7 +831,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func toggleEnabled() {
         enabled.toggle()
         updateIcon()
-        if enabled { scheduleRefresh() }
+        if enabled { scheduleRefresh(fresh: true) }
     }
 
     @objc private func grantAccess() {
@@ -702,7 +865,15 @@ private func axElements(_ value: CFTypeRef) -> [AXUIElement] {
 }
 
 private func axNotify(_ observer: AXObserver, _ element: AXUIElement, _ notification: CFString, _ refcon: UnsafeMutableRawPointer?) {
-    DispatchQueue.main.async { App.shared?.scheduleRefresh() }
+    let name = notification as String
+    DispatchQueue.main.async {
+        guard let app = App.shared else { return }
+        if name == kAXFocusedWindowChangedNotification as String {
+            app.noteFocus()
+        } else {
+            app.scheduleRefresh()
+        }
+    }
 }
 
 private func tapCallback(_ proxy: CGEventTapProxy, _ type: CGEventType, _ event: CGEvent, _ userInfo: UnsafeMutableRawPointer?) -> Unmanaged<CGEvent>? {

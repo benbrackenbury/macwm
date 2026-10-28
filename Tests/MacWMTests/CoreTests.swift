@@ -89,6 +89,35 @@ final class CoreTests: XCTestCase {
         XCTAssertEqual(layout.leaves(), [2, 1])
     }
 
+    func testListedWindowsReadsCoreGraphicsNumbers() {
+        let rows: [[String: Any]] = [
+            [
+                kCGWindowNumber as String: NSNumber(value: 42),
+                kCGWindowOwnerPID as String: NSNumber(value: 7),
+                kCGWindowLayer as String: NSNumber(value: 0),
+                kCGWindowIsOnscreen as String: NSNumber(value: true),
+                kCGWindowBounds as String: [
+                    "X": NSNumber(value: 10),
+                    "Y": NSNumber(value: 20),
+                    "Width": NSNumber(value: 30),
+                    "Height": NSNumber(value: 40),
+                ],
+            ],
+            [
+                kCGWindowNumber as String: 9,
+                kCGWindowOwnerPID as String: 3,
+                kCGWindowLayer as String: 3,
+                kCGWindowIsOnscreen as String: false,
+                kCGWindowBounds as String: ["X": 0, "Y": 0, "Width": 1, "Height": 1],
+            ],
+        ]
+        let windows = listedWindows(rows)
+        XCTAssertEqual(windows.count, 2)
+        XCTAssertEqual(windows[0], ListedWindow(id: 42, pid: 7, bounds: CGRect(x: 10, y: 20, width: 30, height: 40), layer: 0, onScreen: true))
+        XCTAssertEqual(windows[1].layer, 3)
+        XCTAssertFalse(windows[1].onScreen)
+    }
+
     func testConfigReplacesListsAndKeepsDefaults() {
         let (parsed, warnings) = Config.parse(Config.defaultText)
         XCTAssertEqual(warnings, [])
