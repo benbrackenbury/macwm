@@ -42,6 +42,7 @@ fastlane/test_output
 
 # macOS
 .DS_Store
+macwm.app/
 ._*
 .Spotlight-V100
 .Trashes
