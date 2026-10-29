@@ -78,6 +78,21 @@ final class CoreTests: XCTestCase {
         XCTAssertEqual(frames[2]!.width, 50, accuracy: 0.01)
     }
 
+    func testEaseOutIsFrontLoaded() {
+        let from = CGRect(x: 0, y: 0, width: 100, height: 80)
+        let to = CGRect(x: 100, y: 40, width: 40, height: 120)
+        let start = eased(from, to, 0)
+        XCTAssertEqual(start.minX, 0, accuracy: 0.01)
+        XCTAssertEqual(start.width, 100, accuracy: 0.01)
+        let mid = eased(from, to, 0.5)
+        XCTAssertEqual(mid.minX, 87.5, accuracy: 0.01)
+        XCTAssertEqual(mid.minY, 35, accuracy: 0.01)
+        XCTAssertEqual(mid.width, 47.5, accuracy: 0.01)
+        let end = eased(from, to, 1)
+        XCTAssertEqual(end, to)
+        XCTAssertEqual(eased(from, to, 2), to)
+    }
+
     func testNeighborAndSwap() {
         var layout = Layout(splitRatio: 0.5)
         let work = CGRect(x: 0, y: 0, width: 200, height: 100)
