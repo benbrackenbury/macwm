@@ -4,7 +4,7 @@ A dwindle tiling window manager for macOS. New windows split the focused pane. W
 
 Mission Control, trackpad gestures, and fullscreen Spaces stay Apple's. macwm never creates or switches a Space, and it does not need SIP turned off.
 
-Windows move instantly. There is no fake animation.
+A move eases into place with the display refresh. Resize keys track the keyboard immediately. With Reduce Motion on, every change snaps.
 
 ## Install
 

@@ -2,12 +2,17 @@ import AppKit
 import ApplicationServices
 import CoreGraphics
 import Darwin
+import QuartzCore
 
 // Tiles the windows already on each display's current macOS Space.
-// SkyLight is called in-process. SIP stays on, and Spaces stay Apple's.
-// Frames go through Accessibility. Batching them with SLSDisableUpdate deadlocks that call.
+// SkyLight is queried in-process. SIP stays on, and Spaces stay Apple's.
+// The window server ignores a frame write on another app's window, so frames
+// stay on Accessibility. SLSDisableUpdate deadlocks that call.
+// A real move eases with the display. A resize key, and Reduce Motion, snap.
 
 private let debug = ProcessInfo.processInfo.environment["MACWM_DEBUG"] == "1"
+private let slideSeconds: CFTimeInterval = 0.18
+private let slideDistance: CGFloat = 28
 
 private func log(_ message: String) {
     if debug { NSLog("macwm: %@", message) }
@@ -180,17 +185,42 @@ private func windowID(_ element: AXUIElement) -> UInt32? {
     return axWindowID(element, &id) == 0 ? id : nil
 }
 
-private func setFrame(_ element: AXUIElement, _ rect: CGRect, from current: CGRect) {
-    let sizeChanged = abs(current.width - rect.width) >= 2 || abs(current.height - rect.height) >= 2
-    let originChanged = abs(current.minX - rect.minX) >= 2 || abs(current.minY - rect.minY) >= 2
+/// Ease-out cubic. Most of the travel happens up front, then it settles.
+func eased(_ from: CGRect, _ to: CGRect, _ t: CGFloat) -> CGRect {
+    let u = 1 - min(max(t, 0), 1)
+    let e = 1 - u * u * u
+    return CGRect(
+        x: from.minX + (to.minX - from.minX) * e,
+        y: from.minY + (to.minY - from.minY) * e,
+        width: from.width + (to.width - from.width) * e,
+        height: from.height + (to.height - from.height) * e
+    )
+}
+
+private func point(_ rect: CGRect) -> (CGPoint, CGSize) {
+    (
+        CGPoint(x: rect.minX.rounded(), y: rect.minY.rounded()),
+        CGSize(width: rect.width.rounded(), height: rect.height.rounded())
+    )
+}
+
+/// Size, then position, then size again when `settle` is set.
+/// The window server clamps a size that would hang off the screen, and accepts it once the origin is in range.
+private func setFrame(_ element: AXUIElement, _ rect: CGRect, from current: CGRect, settle: Bool) {
+    var origin = point(rect).0
+    var extent = point(rect).1
+    let (haveOrigin, haveSize) = point(current)
+    let sizeChanged = extent != haveSize
+    let originChanged = origin != haveOrigin
     guard sizeChanged || originChanged else { return }
-    var origin = rect.origin
-    var extent = rect.size
     if sizeChanged, let size = AXValueCreate(.cgSize, &extent) {
         AXUIElementSetAttributeValue(element, kAXSizeAttribute as CFString, size)
     }
     if originChanged, let pos = AXValueCreate(.cgPoint, &origin) {
         AXUIElementSetAttributeValue(element, kAXPositionAttribute as CFString, pos)
+    }
+    if settle, sizeChanged, let size = AXValueCreate(.cgSize, &extent) {
+        AXUIElementSetAttributeValue(element, kAXSizeAttribute as CFString, size)
     }
 }
 
@@ -250,6 +280,14 @@ private struct LiveWindow {
     var bounds: CGRect
 }
 
+private struct Slide {
+    var element: AXUIElement
+    var from: CGRect
+    var to: CGRect
+    var began: CFTimeInterval
+    var sent: CGRect
+}
+
 fileprivate final class Hotkeys {
     private let lock = NSLock()
     private var main = Mods.globe
@@ -292,7 +330,11 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var mouseMonitor: Any?
     private var watch: DispatchSourceFileSystemObject?
     private var refreshItem: DispatchWorkItem?
+    private var refreshSoon = false
     private var configItem: DispatchWorkItem?
+    private var slideLink: CADisplayLink?
+    private var slides: [UInt32: Slide] = [:]
+    private var direct = false
     private var layouts: [TileKey: Layout] = [:]
     private var workRects: [TileKey: CGRect] = [:]
     private var focusHistory: [TileKey: UInt32] = [:]
@@ -336,6 +378,9 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         if let tap { CGEvent.tapEnable(tap: tap, enable: false) }
+        slideLink?.invalidate()
+        slideLink = nil
+        slides.removeAll()
     }
 
     func keepTapAlive() {
@@ -349,7 +394,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         watchApps()
         watchConfig()
         mouseMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseUp, .rightMouseUp]) { _ in
-            App.shared.scheduleRefresh(fresh: true)
+            App.shared.scheduleRefresh(fresh: true, soon: true)
         }
         Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
             self?.scheduleRefresh(fresh: true)
@@ -444,13 +489,19 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     /// `fresh` drops the cached display/space for each window. Drags, space changes, and the 1s timer need that. Focus changes do not.
-    func scheduleRefresh(fresh: Bool = false) {
+    /// `soon` is a key or a mouse-up. Notifications stay debounced, and a soon pass is not pushed back by one.
+    func scheduleRefresh(fresh: Bool = false, soon: Bool = false) {
         guard started, enabled, AXIsProcessTrusted() else { return }
         if fresh { spotsStale = true }
+        if soon { refreshSoon = true }
         refreshItem?.cancel()
-        let item = DispatchWorkItem { [weak self] in self?.refresh() }
+        let item = DispatchWorkItem { [weak self] in
+            self?.refreshSoon = false
+            self?.refresh()
+        }
         refreshItem = item
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.02, execute: item)
+        let delay: TimeInterval = refreshSoon ? 0 : 0.02
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: item)
     }
 
     func noteFocus() {
@@ -460,13 +511,20 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func refresh() {
         guard enabled, AXIsProcessTrusted() else { return }
-        if NSEvent.pressedMouseButtons != 0 { return }
+        if NSEvent.pressedMouseButtons != 0 {
+            dropSlides()
+            return
+        }
         if displayAnimating(), animSkips < 10 {
+            slideLink?.isPaused = true
             animSkips += 1
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in self?.refresh() }
             return
         }
         animSkips = 0
+        let jump = direct
+        direct = false
+        let reduce = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
         if spotsStale {
             spot.removeAll(keepingCapacity: true)
             skipped.removeAll(keepingCapacity: true)
@@ -483,7 +541,9 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
 
         var nextKeys: [UInt32: TileKey] = [:]
-        var moves: [(AXUIElement, CGRect, CGRect)] = []
+        var snaps: [(AXUIElement, CGRect, CGRect)] = []
+        var easing: [(UInt32, AXUIElement, CGRect, CGRect)] = []
+        keepSlides(Set(windows.map(\.id)))
         let grouped = Dictionary(grouping: windows, by: { TileKey(display: $0.display, space: $0.space) })
         for (key, group) in grouped {
             guard let screen = NSScreen.screens.first(where: { Sky.displayUUID($0) == key.display }) else { continue }
@@ -506,20 +566,121 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 guard let target = targets[window.id] else { continue }
                 if near(window.bounds, target) {
                     misses[window.id] = nil
+                    dropSlide(window.id)
                     continue
                 }
+                if !jump && flying(window.id, to: target) { continue }
                 let previous = misses[window.id]
                 let count = previous?.target == target ? previous?.count ?? 0 : 0
                 // ponytail: stop after 3 rejects so a window that will not move cannot flash forever.
-                if count >= 3 { continue }
+                if count >= 3 {
+                    dropSlide(window.id)
+                    continue
+                }
                 misses[window.id] = (target, count + 1)
-                moves.append((window.element, target, window.bounds))
+                let ease = !jump && !reduce && count == 0 && travel(window.bounds, target) > slideDistance
+                if ease {
+                    easing.append((window.id, window.element, window.bounds, target))
+                } else {
+                    dropSlide(window.id)
+                    snaps.append((window.element, target, window.bounds))
+                }
             }
         }
         windowKey = nextKeys
-        log(String(format: "refresh %.0fms windows %d moves %d", Date().timeIntervalSince(started) * 1000, windows.count, moves.count))
-        guard !moves.isEmpty else { return }
-        for (element, rect, bounds) in moves { setFrame(element, rect, from: bounds) }
+        if !steer(easing) {
+            for (id, element, bounds, target) in easing {
+                dropSlide(id)
+                snaps.append((element, target, bounds))
+            }
+        }
+        log(String(format: "refresh %.0fms windows %d ease %d snap %d", Date().timeIntervalSince(started) * 1000, windows.count, slides.count, snaps.count))
+        for (element, rect, bounds) in snaps { setFrame(element, rect, from: bounds, settle: true) }
+        if !slides.isEmpty { slideLink?.isPaused = false }
+    }
+
+    private func travel(_ a: CGRect, _ b: CGRect) -> CGFloat {
+        max(abs(a.minX - b.minX), abs(a.minY - b.minY), abs(a.width - b.width), abs(a.height - b.height))
+    }
+
+    private func flying(_ id: UInt32, to target: CGRect) -> Bool {
+        guard let slide = slides[id] else { return false }
+        return near(slide.to, target)
+    }
+
+    private func ensureSlideLink() -> CADisplayLink? {
+        if let slideLink { return slideLink }
+        guard let screen = NSScreen.main ?? NSScreen.screens.first else { return nil }
+        let link = screen.displayLink(target: self, selector: #selector(stepSlide(_:)))
+        link.add(to: .main, forMode: .common)
+        link.isPaused = true
+        slideLink = link
+        return link
+    }
+
+    /// Returns false when the display link cannot run, so the caller snaps instead.
+    private func steer(_ items: [(UInt32, AXUIElement, CGRect, CGRect)]) -> Bool {
+        if items.isEmpty { return true }
+        guard let link = ensureSlideLink() else { return false }
+        let now = CACurrentMediaTime()
+        for (id, element, bounds, target) in items {
+            if var slide = slides[id], near(slide.to, target) {
+                slide.element = element
+                slides[id] = slide
+                continue
+            }
+            let from = slides[id].map { eased($0.from, $0.to, slideProgress($0, now)) } ?? bounds
+            let sent = slides[id]?.sent ?? bounds
+            slides[id] = Slide(element: element, from: from, to: target, began: now, sent: sent)
+        }
+        link.isPaused = false
+        return true
+    }
+
+    private func slideProgress(_ slide: Slide, _ now: CFTimeInterval) -> CGFloat {
+        CGFloat(min(1, max(0, (now - slide.began) / slideSeconds)))
+    }
+
+    private func dropSlide(_ id: UInt32) {
+        slides.removeValue(forKey: id)
+        if slides.isEmpty { slideLink?.isPaused = true }
+    }
+
+    private func dropSlides() {
+        slides.removeAll()
+        slideLink?.isPaused = true
+    }
+
+    private func keepSlides(_ ids: Set<UInt32>) {
+        guard !slides.isEmpty else { return }
+        slides = slides.filter { ids.contains($0.key) }
+        if slides.isEmpty { slideLink?.isPaused = true }
+    }
+
+    @objc private func stepSlide(_ link: CADisplayLink) {
+        if NSEvent.pressedMouseButtons != 0 || displayAnimating() {
+            link.isPaused = true
+            return
+        }
+        let now = CACurrentMediaTime()
+        var finished: [UInt32] = []
+        for id in Array(slides.keys) {
+            guard var slide = slides[id] else { continue }
+            let t = slideProgress(slide, now)
+            if t >= 1 {
+                setFrame(slide.element, slide.to, from: slide.from, settle: true)
+                finished.append(id)
+            } else {
+                let frame = eased(slide.from, slide.to, t)
+                setFrame(slide.element, frame, from: slide.sent, settle: false)
+                slide.sent = frame
+                slides[id] = slide
+            }
+        }
+        for id in finished { slides.removeValue(forKey: id) }
+        guard slides.isEmpty else { return }
+        link.isPaused = true
+        if !finished.isEmpty { scheduleRefresh() }
     }
 
     private func displayAnimating() -> Bool {
@@ -599,6 +760,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 continue
             }
             elements[id] = element
+            AXUIElementSetMessagingTimeout(element, 0.08)
             pids[id] = pid
             if bundles[id] == nil, let bundle = NSRunningApplication(processIdentifier: pid)?.bundleIdentifier {
                 bundles[id] = bundle
@@ -673,7 +835,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
             closeFocused()
         case .reload:
             loadConfig()
-            scheduleRefresh()
+            scheduleRefresh(soon: true)
         }
     }
 
@@ -685,7 +847,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
             layout.swap(id, next)
             layouts[key] = layout
             focusHistory[key] = id
-            scheduleRefresh()
+            scheduleRefresh(soon: true)
         } else {
             focus(next)
         }
@@ -693,24 +855,27 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func resize(_ dir: Direction) {
         guard let id = focusedWindow(), let key = windowKey[id], var layout = layouts[key] else { return }
+        direct = true
         layout.resize(id, toward: dir)
         layouts[key] = layout
-        scheduleRefresh()
+        scheduleRefresh(soon: true)
     }
 
     private func focus(_ id: UInt32) {
         guard let element = elements[id], let pid = pids[id] else { return }
-        let app = AXUIElementCreateApplication(pid)
+        let app = applicationElement(pid)
         AXUIElementSetAttributeValue(app, kAXFocusedWindowAttribute as CFString, element)
         AXUIElementSetAttributeValue(element, kAXMainAttribute as CFString, kCFBooleanTrue)
-        NSRunningApplication(processIdentifier: pid)?.activate()
+        if NSWorkspace.shared.frontmostApplication?.processIdentifier != pid {
+            NSRunningApplication(processIdentifier: pid)?.activate()
+        }
         if let key = windowKey[id] { focusHistory[key] = id }
     }
 
     private func toggleFloat() {
         guard let id = focusedWindow(), elements[id] != nil else { return }
         overrides[id] = !floating(id, bundle: bundles[id])
-        scheduleRefresh()
+        scheduleRefresh(soon: true)
     }
 
     private func closeFocused() {
@@ -719,7 +884,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
               CFGetTypeID(button) == AXUIElementGetTypeID()
         else { return }
         AXUIElementPerformAction(unsafeBitCast(button, to: AXUIElement.self), kAXPressAction as CFString)
-        scheduleRefresh()
+        scheduleRefresh(soon: true)
     }
 
     private func focusedElement() -> AXUIElement? {
@@ -831,7 +996,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func toggleEnabled() {
         enabled.toggle()
         updateIcon()
-        if enabled { scheduleRefresh(fresh: true) }
+        if enabled { scheduleRefresh(fresh: true, soon: true) }
     }
 
     @objc private func grantAccess() {
